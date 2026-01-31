@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from discord import AllowedMentions
 
 load_dotenv()
-# Заменён print на логирование для лучшей отладки
 logging.basicConfig(level=logging.INFO)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -29,7 +28,6 @@ def escape_md_v2(text: str) -> str:
 
 
 async def send_to_telegram(text: str) -> None:
-    # Добавил обработку сетевых исключений
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
         "message_thread_id": TG_TOPIC_ID,
@@ -47,36 +45,44 @@ async def send_to_telegram(text: str) -> None:
         raise RuntimeError(f"Failed to send to Telegram: {e}")
 
 
-def parse_et_datetime(s: str) -> datetime:
-    """
-    Accept ET(=UTC):
-      - 'DD.MM.YYYY HH:MM'
-      - 'DD.MM HH:MM' (year inferred from current UTC; if already past, rolls to next year)
-    """
-    s = s.strip()
+def parse_et_date_time(date_s: str, time_s: str) -> datetime:
+
+    date_s = date_s.strip()
+    time_s = time_s.strip()
+
+    tm = re.fullmatch(r"(\d{2}):(\d{2})", time_s)
+    if not tm:
+        raise ValueError("Bad time format. Use 'HH:MM' ET.")
+    hour, minute = map(int, tm.groups())
+
+    # date with year
     try:
-        d = datetime.strptime(s, "%d.%m.%Y %H:%M")
-        return d.replace(tzinfo=timezone.utc)
+        d = datetime.strptime(date_s, "%d.%m.%Y")
+        try:
+            return datetime(d.year, d.month, d.day, hour, minute, tzinfo=timezone.utc)
+        except ValueError:
+            raise ValueError("Invalid date/time values.")
     except ValueError:
         pass
 
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})", s)
-    if not m:
-        raise ValueError("Bad datetime format. Use 'DD.MM.YYYY HH:MM ET' or 'DD.MM HH:MM ET'.")
+    # date without year
+    dm = re.fullmatch(r"(\d{2})\.(\d{2})", date_s)
+    if not dm:
+        raise ValueError("Bad date format. Use 'DD.MM.YYYY' or 'DD.MM' ET.")
+    day, month = map(int, dm.groups())
 
-    day, month, hour, minute = map(int, m.groups())
     now = datetime.now(timezone.utc)
-    #валидация даты с try-except для предотвращения ValueError от datetime()
     try:
-        d = datetime(now.year, month, day, hour, minute, tzinfo=timezone.utc)
+        dt = datetime(now.year, month, day, hour, minute, tzinfo=timezone.utc)
     except ValueError:
-        raise ValueError("Invalid date values.")
-    if d < now:
+        raise ValueError("Invalid date/time values.")
+
+    if dt < now:
         try:
-            d = datetime(now.year + 1, month, day, hour, minute, tzinfo=timezone.utc)
+            dt = datetime(now.year + 1, month, day, hour, minute, tzinfo=timezone.utc)
         except ValueError:
-            raise ValueError("Invalid date values.")
-    return d
+            raise ValueError("Invalid date/time values.")
+    return dt
 
 
 def discord_time(ts: int) -> str:
@@ -89,8 +95,8 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 PING_TYPES = [
-    app_commands.Choice(name="STRATOP", value="STRATOP"),
-    app_commands.Choice(name="STRATOP pre-ping", value="STRATOP_PREPING"),
+    app_commands.Choice(name="STRAT-OP Флот СОБИРАЕТСЯ!", value="STRATOP_FORMING"),
+    app_commands.Choice(name="STRAT-OP pre-ping", value="STRATOP_PREPING"),
     app_commands.Choice(name="PRE-PING", value="PREPING"),
 ]
 
@@ -111,7 +117,8 @@ async def on_ready():
 @tree.command(name="ping", description="Пинг на ДС и ТГ")
 @app_commands.describe(
     ping_type="Тип пинга",
-    when_et="Дата/время ET: DD.MM.YYYY HH:MM или DD.MM HH:MM",
+    date_et="Дата ET: DD.MM.YYYY или DD.MM (для pre-ping)",
+    time_et="Время ET: HH:MM (для pre-ping)",
     formup="Место сбора",
     doctrine="Доктрина",
     fc="FC",
@@ -125,7 +132,8 @@ async def on_ready():
 async def eveping(
     interaction: discord.Interaction,
     ping_type: app_commands.Choice[str],
-    when_et: str,
+    date_et: str = "",
+    time_et: str = "",
     formup: str = "TBD",
     doctrine: str = "TBD",
     fc: str = "TBD",
@@ -135,26 +143,41 @@ async def eveping(
     room: str = "",
     tg: bool = True,
 ):
-    # Ack early to avoid 3s timeout
     await interaction.response.defer()
 
-    try:
-        dt = parse_et_datetime(when_et)
-    except ValueError as e:
-        await interaction.followup.send(str(e), ephemeral=True)
-        return
+    label = ping_type.name
 
-    ts = int(dt.timestamp())
-    label = ping_type.name  # human label
+    dt: datetime | None = None
+    ts: int | None = None
 
-    # Шаблон сообщения
-    # Убрал дублирование: поля Доктрина и FC добавляются одинаково для всех типов пингов
+    # STRATOP собирается — без даты и времени
+    if ping_type.value == "STRATOP_FORMING":
+        dt = None
+        ts = None
+    else:
+        # STRATOP pre-ping / PRE-PING — раздельный ввод
+        if not date_et.strip() or not time_et.strip():
+            await interaction.followup.send(
+                "Для этого типа пинга нужно заполнить date_et и time_et (ET).",
+                ephemeral=True,
+            )
+            return
+        try:
+            dt = parse_et_date_time(date_et, time_et)
+        except ValueError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
+        ts = int(dt.timestamp())
+
     embed = discord.Embed(title=f"🚨 {label}", color=discord.Color.red())
-    embed.add_field(
-        name="Дата / время",
-        value=f"{dt.strftime('%d.%m.%Y %H:%M')} ET\n{discord_time(ts)}",
-        inline=False,
-    )
+
+    if dt is not None and ts is not None:
+        embed.add_field(
+            name="Дата / время",
+            value=f"{dt.strftime('%d.%m.%Y %H:%M')} ET\n{discord_time(ts)}",
+            inline=False,
+        )
+
     embed.add_field(name="Место сбора", value=formup, inline=False)
     embed.add_field(name="Доктрина", value=doctrine, inline=False)
     embed.add_field(name="FC", value=fc, inline=True)
@@ -167,22 +190,25 @@ async def eveping(
     if notes.strip():
         embed.add_field(name="Примечание", value=notes, inline=False)
 
-    # Отправить @everyone
-    msg = await interaction.followup.send(content="@everyone", embed=embed, allowed_mentions=AllowedMentions(everyone=True))
+    msg = await interaction.followup.send(
+        content="@everyone",
+        embed=embed,
+        allowed_mentions=AllowedMentions(everyone=True),
+    )
     jump_url = msg.jump_url
 
     if include_link:
         embed.add_field(name="Ссылка", value=f"[Ссылка на этот пинг]({jump_url})", inline=False)
         await msg.edit(content="@everyone", embed=embed, allowed_mentions=AllowedMentions(everyone=True))
 
-    # Telegram repost
     if tg:
         tg_lines = []
         tg_lines.append(f"*🚨 {escape_md_v2(label)}*")
         tg_lines.append("")
 
-        tg_lines.append("*Дата / время*")
-        tg_lines.append(f"{escape_md_v2(dt.strftime('%d.%m.%Y %H:%M'))} ET")
+        if dt is not None:
+            tg_lines.append("*Дата / время*")
+            tg_lines.append(f"{escape_md_v2(dt.strftime('%d.%m.%Y %H:%M'))} ET")
 
         tg_lines.append("*Место сбора*")
         tg_lines.append(escape_md_v2(formup))
@@ -193,7 +219,6 @@ async def eveping(
         tg_lines.append("*FC*")
         tg_lines.append(escape_md_v2(fc))
 
-
         if comms != "False":
             tg_lines.append("*Comms*")
             tg_lines.append(escape_md_v2(comms))
@@ -201,7 +226,6 @@ async def eveping(
             if room.strip():
                 tg_lines.append("*Комната*")
                 tg_lines.append(escape_md_v2(room))
-                
 
         if notes.strip():
             tg_lines.append("*Примечание*")
@@ -213,7 +237,6 @@ async def eveping(
             tg_lines.append("")
 
         tg_text = "\n".join(tg_lines)
-
         await send_to_telegram(tg_text)
 
 
